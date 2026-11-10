@@ -9,6 +9,8 @@ ARG BUILD_DATE
 ARG VERSION
 ARG QBITTORRENT_VERSION
 ARG QBT_CLI_VERSION
+# set by buildx: amd64 or arm64 (the base and unrar images are multi-arch)
+ARG TARGETARCH
 LABEL build_version="Linuxserver.io version:- ${VERSION} Build-date:- ${BUILD_DATE}"
 LABEL maintainer="thespad"
 
@@ -19,6 +21,14 @@ XDG_DATA_HOME="/config"
 
 # install runtime packages and qbitorrent-cli
 RUN \
+  echo "**** select binaries for ${TARGETARCH} ****" && \
+  case "${TARGETARCH}" in \
+    amd64) QBT_ARCH="x86_64"; QBT_CLI_ARCH="x64" ;; \
+    arm64) QBT_ARCH="aarch64"; QBT_CLI_ARCH="arm64" ;; \
+    *) echo "unsupported architecture: ${TARGETARCH}" && exit 1 ;; \
+  esac && \
+  echo "**** upgrade base packages ****" && \
+  apk upgrade --no-cache && \
   echo "**** install packages ****" && \
   apk add --no-cache \
     grep \
@@ -30,9 +40,9 @@ RUN \
     QBITTORRENT_VERSION=$(curl -sL "https://api.github.com/repos/userdocs/qbittorrent-nox-static/releases" | \
     jq -r 'first(.[] | select(.prerelease == false) | .tag_name)'  | awk -F '-' '{print $2}'); \
   fi && \
-  curl -o \
+  curl -f -o \
     /app/qbittorrent-nox -L \
-    "https://github.com/userdocs/qbittorrent-nox-static/releases/download/release-${QBITTORRENT_VERSION}/x86_64-qbittorrent-nox" && \
+    "https://github.com/userdocs/qbittorrent-nox-static/releases/download/release-${QBITTORRENT_VERSION}/${QBT_ARCH}-qbittorrent-nox" && \
   chmod +x /app/qbittorrent-nox && \
   echo "***** install qbitorrent-cli ****" && \
   mkdir /qbt && \
@@ -40,9 +50,9 @@ RUN \
     QBT_CLI_VERSION=$(curl -sL "https://api.github.com/repos/fedarovich/qbittorrent-cli/releases/latest" \
     | jq -r '. | .tag_name'); \
   fi && \
-  curl -o \
+  curl -f -o \
     /tmp/qbt.tar.gz -L \
-    "https://github.com/fedarovich/qbittorrent-cli/releases/download/${QBT_CLI_VERSION}/qbt-linux-alpine-x64-net6-${QBT_CLI_VERSION#v}.tar.gz" && \
+    "https://github.com/fedarovich/qbittorrent-cli/releases/download/${QBT_CLI_VERSION}/qbt-linux-alpine-${QBT_CLI_ARCH}-net6-${QBT_CLI_VERSION#v}.tar.gz" && \
   tar xf \
     /tmp/qbt.tar.gz -C \
     /qbt && \
