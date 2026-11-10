@@ -1,0 +1,160 @@
+name: build-test-publish
+
+on:
+  push:
+    branches: [master]
+    # date versions, e.g. 2026-11-10
+    tags: ['[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    name: Build and smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v7
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build test image (amd64)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          tags: qbittorrent:test
+          # always rebuild from the latest base so apk upgrade picks up security fixes
+          pull: true
+          no-cache: true
+
+      - name: Build test image (arm64)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/arm64
+          load: true
+          tags: qbittorrent:arm64
+          pull: true
+          no-cache: true
+
+      - name: Both architectures ship their own binaries
+        run: |
+          for tag in test arm64; do
+            docker run --rm --entrypoint sh "qbittorrent:$tag" -c '
+              uname -m
+              /app/qbittorrent-nox --version
+              /qbt/qbt --version
+              for bin in unrar 7z python3; do
+                command -v "$bin" >/dev/null || { echo "missing: $bin"; exit 1; }
+              done
+              test "$(apk list -u 2>/dev/null | wc -l)" -eq 0'
+          done
+
+      - name: Web UI starts and the API works with the temporary password
+        run: |
+          docker run -d --name qbt-test -p 8080:8080 \
+            -e PUID=1000 -e PGID=1000 -e TZ=Etc/UTC -e WEBUI_PORT=8080 \
+            qbittorrent:test
+
+          for _ in $(seq 1 90); do
+            docker logs qbt-test 2>&1 | grep -q 'temporary password' && break
+            sleep 1
+          done
+          password=$(docker logs qbt-test 2>&1 | sed -n 's/.*for this session: \([^ ]*\).*/\1/p' | tail -n1)
+          test -n "$password"
+
+          # the API refuses anonymous calls
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8080/api/v2/app/version)" = 403
+
+          curl -sf -c "$RUNNER_TEMP/cookies" -H 'Referer: http://localhost:8080' \
+            --data-urlencode username=admin --data-urlencode "password=$password" \
+            http://localhost:8080/api/v2/auth/login
+          curl -sf -b "$RUNNER_TEMP/cookies" http://localhost:8080/api/v2/app/version | grep -q '^v5\.'
+
+          # a torrent can be added
+          curl -sf -b "$RUNNER_TEMP/cookies" -H 'Referer: http://localhost:8080' \
+            --data-urlencode 'urls=magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&dn=smoke-test' \
+            http://localhost:8080/api/v2/torrents/add
+          sleep 2
+          curl -sf -b "$RUNNER_TEMP/cookies" http://localhost:8080/api/v2/torrents/info | grep -q '"name":"smoke-test"'
+
+      - name: Restart against the existing config
+        run: |
+          docker restart qbt-test
+          for _ in $(seq 1 90); do
+            if docker logs qbt-test 2>&1 | grep -c '\[ls.io-init\] done.' | grep -q '^2$'; then
+              break
+            fi
+            sleep 1
+          done
+          docker logs qbt-test 2>&1 | grep -c '\[ls.io-init\] done.' | grep -q '^2$'
+
+      - name: Show container logs on failure
+        if: failure()
+        run: docker logs qbt-test || true
+
+      - name: Remove test container
+        if: always()
+        run: docker rm -f qbt-test || true
+
+  publish:
+    name: Publish multi-arch image to GHCR
+    needs: test
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v7
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate image tags
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/qbittorrent
+          tags: |
+            # git tag 2026-11-10 -> image tag 2026-11-10
+            type=ref,event=tag
+            type=ref,event=branch
+            type=sha
+            type=raw,value=latest,enable=${{ github.ref_type == 'tag' || github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # always rebuild from the latest base so apk upgrade picks up security fixes
+          pull: true
+          no-cache: true
